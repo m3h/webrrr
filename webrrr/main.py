@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import http
+import logging
 import re
 import sqlite3
 import time
@@ -18,6 +19,9 @@ import aiohttp
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(encoding="utf-8", level=logging.DEBUG)
 
 USERAGENT = "webrrr"
 
@@ -157,6 +161,27 @@ class DB:
         self.con.commit()
 
     def get_unvisited_url(self, exclude_netlocs: Iterable[str]) -> ParseResult:
+        url = self._fetch_one_object(
+            f"""
+            SELECT url, netloc, last_visited
+            FROM URL
+            WHERE
+                last_visited is NULL
+                and netloc NOT IN ({','.join('?' * len(exclude_netlocs))})
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM URL AS URL2
+                    WHERE
+                        URL2.netloc = URL.netloc
+                        AND URL2.last_visited IS NOT NULL
+                )
+            """,  # noqa: S608
+            list(exclude_netlocs),
+        )
+        if url is not None:
+            return urlparse(url)
+
+        # TODO (m3h): terrible performance below
         # min(NULL, x) = NULL
         url = self._fetch_one_object(
             f"""
@@ -218,6 +243,7 @@ class DB:
     def insert_robots_txt(self, netloc: str, robots_txt: str) -> None:
         cur = self.con.cursor()
         cur.execute("INSERT INTO Robots Values (?, ?)", [netloc, robots_txt])
+        cur.close()
         self.con.commit()
 
 
@@ -234,6 +260,8 @@ class PoolManager:
 
         self.pool.add(task)
         self.netlocs_currently_processing.add(url.netloc)
+
+        logger.info("Pool size: %s", len(self.pool))
 
     def busy(self) -> bool:
         return len(self.pool) > 0
@@ -255,6 +283,7 @@ class PoolManager:
 class Fetcher:
     def __init__(self) -> None:
         self.start = time.time()
+        self.fetched_pages_count = 0
 
         self.processing = set()
 
@@ -301,12 +330,21 @@ class Fetcher:
         new_links, err_str = await self.fetch_children(url)
         if err_str is not None:
             assert len(new_links) == 0
+            logger.error("countered error fetching: %s", err_str[:100])
 
+        self.fetched_pages_count += 1
+        logger.info(
+            "Current rate: %s webpages / second", self.get_fetch_rate_per_second()
+        )
+        logger.info("Total pages fetched: %s", self.fetched_pages_count)
         self.db.add_urls(new_links)
         self.db.add_links(url, new_links)
         self.db.visit_url(url, err_str)
 
         return url
+
+    def get_fetch_rate_per_second(self) -> float:
+        return self.fetched_pages_count / (time.time() - self.start)
 
     def get_canonical_url(self, url_part: str, base_url: ParseResult) -> ParseResult:
         o = urlparse(url_part)
@@ -321,6 +359,7 @@ class Fetcher:
         self,
         url: ParseResult,
     ) -> tuple[set[ParseResult], str | None]:
+        logger.info("Fetching url: %s", url)
         if not (await self.robots_txt_allows_visit(url)):
             return set(), "blocked by robots.txt"
 
@@ -334,7 +373,7 @@ class Fetcher:
                     return set(), response.content_type
 
                 html_text = await response.text()
-        except aiohttp.ClientError as client_error:
+        except (aiohttp.ClientError, UnicodeDecodeError) as client_error:
             return set(), str(client_error)
 
         match_iter = re.finditer(r'href="(?P<href>[^"]+)"', html_text)
@@ -366,6 +405,7 @@ async def orchestrate_url_visits(start_url: str, max_pool_size: int = 5) -> None
 async def main() -> None:
     await orchestrate_url_visits(
         "https://docs.aiohttp.org/en/stable/migration_to_2xx.html",
+        100,
     )
 
 
