@@ -1,44 +1,114 @@
 #!/usr/bin/env python3
+"""Scrape the links of the internet using webrrr."""
 
-import urllib.robotparser
+from __future__ import annotations
+
 import asyncio
-from datetime import datetime, timezone
+import http
 import re
+import sqlite3
+import time
 import urllib.parse
 import urllib.robotparser
-import time
-import sqlite3
-
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
+from urllib.parse import ParseResult
 
 import aiohttp
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 USERAGENT = "webrrr"
 
 
-def now():
-    return datetime.now(tz=timezone.utc)
+# https://docs.python.org/3/library/sqlite3.html#sqlite3-adapter-converter-recipes
+def adapt_datetime_iso(val: datetime) -> str:
+    """Adapt datetime.datetime to timezone-naive ISO 8601 date."""
+    return val.isoformat()
+
+
+sqlite3.register_adapter(datetime, adapt_datetime_iso)
+
+
+def convert_datetime(val: str) -> datetime:
+    """Convert ISO 8601 datetime to datetime.datetime object."""
+    return datetime.fromisoformat(val.decode())
+
+
+sqlite3.register_converter("datetime", convert_datetime)
+
+
+def now(tz: timezone | None = None) -> datetime:
+    """UTC-defaulted version of datetime.now()."""
+    if tz is None:
+        tz = timezone.utc
+    return datetime.now(tz=tz)
+
+
+def urlparse(url: str) -> ParseResult:
+    """Parse URLs and strip fragments."""
+    # parse URL, stripping fragment
+    o = urllib.parse.urlparse(url=url)
+    return ParseResult(
+        scheme=o.scheme,
+        netloc=o.netloc,
+        path=o.path,
+        params=o.params,
+        query=o.query,
+        fragment="",
+    )
 
 
 class DB:
-    def __init__(self, connection_string="data.db"):
+    def __init__(self, connection_string: str = "data.db") -> None:
         self.connection_string = connection_string
         self.con = sqlite3.connect(self.connection_string)
 
         self.create_tables()
 
-    def close(self):
+    def close(self) -> None:
         self.con.close()
 
-    def create_tables(self):
+    def _fetch_one_object(
+        self,
+        sql: str,
+        parameters: Iterable[Any] = (),
+    ) -> object | None:
+        cur = self.con.cursor()
+        cur.execute(sql, parameters)
+        res = cur.fetchone()
+        if res:
+            assert len(res) >= 1
+            return res[0]
+        return None
+
+    def create_tables(self) -> None:
         cur = self.con.cursor()
 
         cur.execute(
-            """CREATE TABLE IF NOT EXISTS URL(url text primary key, netloc text, last_visited datetime, error text, foreign key (netloc) REFERENCES Robots(netloc))"""
+            """
+            CREATE TABLE IF NOT EXISTS
+                URL(
+                    url text primary key,
+                    netloc text,
+                    last_visited datetime,
+                    error text,
+                    foreign key (netloc) REFERENCES Robots(netloc)
+                )
+            """,
         )
         cur.execute(
-            """CREATE TABLE IF NOT EXISTS Robots(netloc text primary key, robots_txt text)"""
+            """
+            CREATE TABLE IF NOT EXISTS
+                Robots(
+                    netloc text primary key,
+                    robots_txt text
+                )
+            """,
         )
-        cur.execute("""
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS
                 Links(
                     parent_url text,
@@ -47,124 +117,143 @@ class DB:
                     foreign key (parent_url) REFERENCES URL(url),
                     foreign key (child_url) REFERENCES URL(url)
                 )
-        """)
+        """
+        )
 
         self.con.commit()
 
-    def add_urls(self, parent_url, urls):
+    def add_urls(self, urls: Iterable[ParseResult]) -> None:
         last_visited = None
 
         cur = self.con.cursor()
         cur.executemany(
-            """INSERT INTO URL (url, netloc, last_visited)
+            """
+            INSERT INTO URL (url, netloc, last_visited)
             SELECT ?, ?, ?
             WHERE NOT EXISTS (
                 SELECT 1 FROM URL WHERE url = ?
             )
         """,
-            [
-                [url, urllib.parse.urlparse(url).netloc, last_visited, url]
-                for url in urls
-            ],
-        )
-
-        cur.executemany(
-            "INSERT INTO Links VALUES (?, ?)", [[parent_url, url] for url in urls]
+            [[url.geturl(), url.netloc, last_visited, url.geturl()] for url in urls],
         )
         self.con.commit()
 
-    def get_unvisited_url(self, exclude_netlocs):
+    def add_links(self, parent_url: ParseResult, urls: Iterable[ParseResult]) -> None:
         cur = self.con.cursor()
 
-        # min(NULL, x)  == NULL
-        cur.execute(
+        cur.executemany(
+            """
+            INSERT INTO Links (parent_url, child_url)
+            SELECT ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM Links WHERE parent_url = ? AND child_url = ?
+            )
+            """,
+            [
+                [parent_url.geturl(), url.geturl(), parent_url.geturl(), url.geturl()]
+                for url in urls
+            ],
+        )
+        self.con.commit()
+
+    def get_unvisited_url(self, exclude_netlocs: Iterable[str]) -> ParseResult:
+        # min(NULL, x) = NULL
+        url = self._fetch_one_object(
             f"""
             SELECT url, netloc, last_visited
             FROM URL
-            WHERE last_visited is NULL and netloc NOT IN ({','.join('?' * len(exclude_netlocs))})
+            WHERE
+                last_visited is NULL
+                and netloc NOT IN ({','.join('?' * len(exclude_netlocs))})
             ORDER BY (
               SELECT MIN(last_visited)
               FROM URL as URL2
               where URL2.netloc = URL.netloc
             )
-        """,
+        """,  # noqa: S608
             list(exclude_netlocs),
         )
-        res = cur.fetchone()
-        if res:
-            return res[0]
-        else:
-            return None
+        if url is not None:
+            return urlparse(url)
+        return None
 
-    def get_unvisited_url_count(self, exclude_netlocs={}):
-        cur = self.con.cursor()
+    def visit_url(self, url: ParseResult, error_str: str) -> None:
+        self.add_urls([url])
 
-        # min(NULL, x)  == NULL
-        cur.execute(
-            f"""
-            SELECT COUNT(1), url, netloc, last_visited
-            FROM URL
-            WHERE last_visited is NULL and netloc NOT IN ({','.join('?' * len(exclude_netlocs))})
-            ORDER BY (
-              SELECT MIN(last_visited)
-              FROM URL as URL2
-              where URL2.netloc = URL.netloc
-            )
-        """,
-            exclude_netlocs,
-        )
-        res = cur.fetchone()
-        if res:
-            return res[0]
-        else:
-            return None
-
-    def visit_url(self, url, error_str):
         last_visited = now()
 
         cur = self.con.cursor()
         cur.execute(
             "UPDATE URL SET last_visited = ?, error = ? WHERE url = ?",
-            [last_visited, error_str, url],
+            [last_visited, error_str, url.geturl()],
         )
+        assert cur.lastrowid
         self.con.commit()
 
-    def count_visited(self):
-        cur = self.con.cursor()
-        cur.execute("SELECT COUNT(1) FROM URL WHERE last_visited is not NULL")
-        res = cur.fetchone()
-        if res:
-            return res[0]
-        else:
-            return None
-
-    def is_visited(self, url):
-        cur = self.con.cursor()
-        cur.execute(
-            "SELECT COUNT(1) FROM URL WHERE last_visited is not NULL AND url = ?", [url]
+    def count_visited(self) -> int:
+        return self._fetch_one_object(
+            "SELECT COUNT(1) FROM URL WHERE last_visited is not NULL",
         )
-        return cur.fetchone() is not None
 
-    def get_robots_txt_text(self, netloc):
-        cur = self.con.cursor()
-        cur.execute("SELECT robots_txt FROM Robots WHERE netloc = ?", [netloc])
-        res = cur.fetchone()
-        if res:
-            return res[0]
-        return None
+    def count_unvisited(self) -> int:
+        return self._fetch_one_object(
+            "SELECT COUNT(1) FROM URL WHERE last_visited is NULL",
+        )
 
-    def insert_robots_txt(self, netloc, robots_txt):
-        # last_visited = now()
+    def is_visited(self, url: ParseResult) -> bool:
+        return (
+            self._fetch_one_object(
+                "SELECT COUNT(1) FROM URL WHERE last_visited is not NULL AND url = ?",
+                [url.geturl()],
+            )
+            == 1
+        )
 
+    def get_robots_txt_text(self, netloc: str) -> str:
+        return self._fetch_one_object(
+            "SELECT robots_txt FROM Robots WHERE netloc = ?",
+            [netloc],
+        )
+
+    def insert_robots_txt(self, netloc: str, robots_txt: str) -> None:
         cur = self.con.cursor()
         cur.execute("INSERT INTO Robots Values (?, ?)", [netloc, robots_txt])
         self.con.commit()
 
 
-class Fetcher:
-    def __init__(self, start_url: str, num_workers: int = 5):
-        self.num_workers = num_workers
+class PoolManager:
+    def __init__(self, max_pool_size: int) -> None:
+        self.max_pool_size = max_pool_size
 
+        self.pool = set()
+        self.netlocs_currently_processing = set()
+
+    async def add_to_pool(self, url: ParseResult, task: asyncio.Task) -> bool:
+        while len(self.pool) >= self.max_pool_size:
+            await self.wait()
+
+        self.pool.add(task)
+        self.netlocs_currently_processing.add(url.netloc)
+
+    def busy(self) -> bool:
+        return len(self.pool) > 0
+
+    def _pop_from_pool(self, url: ParseResult, task: asyncio.Task) -> None:
+        self.pool.remove(task)
+        self.netlocs_currently_processing.remove(url.netloc)
+
+    async def wait(self) -> None:
+        done_tasks, _pending_tasks = await asyncio.wait(
+            self.pool,
+            return_when="FIRST_COMPLETED",
+        )
+        for done_task in done_tasks:
+            done_url: ParseResult = await done_task
+            self._pop_from_pool(done_url, done_task)
+
+
+class Fetcher:
+    def __init__(self) -> None:
         self.start = time.time()
 
         self.processing = set()
@@ -173,124 +262,111 @@ class Fetcher:
 
         self.db = DB()
 
-        self.db.add_urls(None, [start_url])
-
-    def close(self):
+    def close(self) -> None:
         self.session.close()
         self.db.close()
 
-    def count_visited(self):
-        return self.db.count_visited()
-
-    async def robots_txt_allows_visit(self, url: str):
-        o = urllib.parse.urlparse(url)
-
-        if not (robots_txt_contents := self.db.get_robots_txt_text(o.netloc)):
+    async def robots_txt_allows_visit(self, url: ParseResult) -> bool:
+        if not (robots_txt_contents := self.db.get_robots_txt_text(url.netloc)):
             robots_url = urllib.parse.urlunparse(
-                (o.scheme, o.netloc, "/robots.txt", "", "", "")
+                (url.scheme, url.netloc, "/robots.txt", "", "", ""),
             )
             try:
                 async with self.session.get(
-                    robots_url, allow_redirects=True
+                    robots_url,
+                    allow_redirects=True,
                 ) as robots_response:
                     # no robots.txt - implicit allow
-                    if 400 <= robots_response.status <= 499:
+                    if robots_response.status in (
+                        http.HTTPStatus.NOT_FOUND,
+                        http.HTTPStatus.FORBIDDEN,
+                    ):
                         return True
                     robots_response.raise_for_status()
                     robots_txt_contents = await robots_response.text()
-            except aiohttp.ClientError as client_error:
-                print(client_error)
+            except (aiohttp.ClientError, UnicodeDecodeError):
                 return False
 
-            self.db.insert_robots_txt(o.netloc, robots_txt_contents)
+            self.db.insert_robots_txt(url.netloc, robots_txt_contents)
 
         robot_file_parser = urllib.robotparser.RobotFileParser()
         robot_file_parser.parse(robots_txt_contents.splitlines())
 
-        return robot_file_parser.can_fetch(useragent="webrrr", url=url)
+        return robot_file_parser.can_fetch(useragent="webrrr", url=url.geturl())
 
-    def get_next_url(self):
-        return self.db.get_unvisited_url(self.processing)
+    def fetch_and_process_url_task(self, url: ParseResult) -> asyncio.Task:
+        return asyncio.create_task(self._fetch_and_process_url(url))
 
-    async def process_next_url(self):
-        next_url = self.get_next_url()
-        if next_url is None:
-            return None
-        o = urllib.parse.urlparse(next_url)
-        self.processing.add(o.netloc)
-
-        new_links, err_str = await self.fetch_children(next_url)
+    async def _fetch_and_process_url(self, url: ParseResult) -> None:
+        new_links, err_str = await self.fetch_children(url)
         if err_str is not None:
             assert len(new_links) == 0
-            print(f"[{datetime.now().isoformat()}] ERROR: [{next_url}] [{err_str}]")
 
-        self.db.add_urls(next_url, new_links)
-        self.db.visit_url(next_url, err_str)
+        self.db.add_urls(new_links)
+        self.db.add_links(url, new_links)
+        self.db.visit_url(url, err_str)
 
-        self.processing.remove(o.netloc)
+        return url
 
-        print(f"visited: {self.count_visited()}")
+    def get_canonical_url(self, url_part: str, base_url: ParseResult) -> ParseResult:
+        o = urlparse(url_part)
 
-        t = time.time() - self.start
-
-        print(f"total time: {t}, rate = {self.count_visited() / t}")
-
-    async def orchestrate_url_visits(self):
-        # pool = {asyncio.create_task(self.process_next_url())}
-        pool = set()
-
-        pool_size = len(pool)
-
-        while self.db.get_unvisited_url_count():
-            done, pending = await asyncio.wait(pool, return_when="FIRST_COMPLETED")
-            for task in done:
-                await task
-
-            pool = pending
-            while len(pool) < pool_size and self.db.get_unvisited_url_count():
-                pool.add(asyncio.create_task(self.process_next_url()))
-            # slowly ramp up pool size so that we don't overwhelm single netloc at beginning
-            pool_size = min(self.num_workers, pool_size + 1)
-
-    def get_canonical_url(self, url_part: str, base_url: str):
-        o = urllib.parse.urlparse(url_part)
-
-        fragment = ""
         if o.scheme == "" and o.netloc == "":
-            base_o = urllib.parse.urlparse(base_url)
-            return urllib.parse.urlunparse(
-                (base_o.scheme, base_o.netloc, o.path, o.params, o.query, fragment)
+            return ParseResult(
+                base_url.scheme, base_url.netloc, o.path, o.params, o.query, o.fragment
             )
-        else:
-            return urllib.parse.urlunparse(
-                (o.scheme, o.netloc, o.path, o.params, o.query, fragment)
-            )
+        return o
 
-    async def fetch_children(self, url: str):
+    async def fetch_children(
+        self,
+        url: ParseResult,
+    ) -> tuple[set[ParseResult], str | None]:
+        if not (await self.robots_txt_allows_visit(url)):
+            return set(), "blocked by robots.txt"
+
         try:
-            if not (await self.robots_txt_allows_visit(url)):
-                return set(), "blocked by robots.txt"
-
-            print(f"[{datetime.now().isoformat()}] FETCH {url}")
-
-            async with self.session.get(url, allow_redirects=True) as response:
+            async with self.session.get(url.geturl(), allow_redirects=True) as response:
+                if not response.ok:
+                    return set(), await response.text()
                 response.raise_for_status()
 
-                html_text = await response.text()
+                if response.content_type.lower() != "text/html":
+                    return set(), response.content_type
 
-            match_iter = re.finditer(r'href="(?P<href>[^"]+)"', html_text)
-            urls = set(self.get_canonical_url(m.groups()[0], url) for m in match_iter)
-            return urls, None
-        except Exception as client_error:
+                html_text = await response.text()
+        except aiohttp.ClientError as client_error:
             return set(), str(client_error)
 
+        match_iter = re.finditer(r'href="(?P<href>[^"]+)"', html_text)
+        urls = {self.get_canonical_url(m.groups()[0], url) for m in match_iter}
+        urls = {*filter(lambda url: url.scheme in {"http", "https"}, urls)}
+        return urls, None
 
-async def main():
-    # create_tables()
-    # return
-    f = Fetcher("https://docs.aiohttp.org/en/stable/migration_to_2xx.html")
 
-    await f.orchestrate_url_visits()
+async def orchestrate_url_visits(start_url: str, max_pool_size: int = 5) -> None:
+    fetcher = Fetcher()
+    pool_manager = PoolManager(max_pool_size)
+
+    unvisited_url = urlparse(start_url)
+
+    while unvisited_url or pool_manager.busy():
+        if unvisited_url:
+            task = fetcher.fetch_and_process_url_task(unvisited_url)
+            await pool_manager.add_to_pool(unvisited_url, task)
+        else:
+            await pool_manager.wait()
+
+        unvisited_url = fetcher.db.get_unvisited_url(
+            exclude_netlocs=pool_manager.netlocs_currently_processing
+        )
+
+    fetcher.close()
+
+
+async def main() -> None:
+    await orchestrate_url_visits(
+        "https://docs.aiohttp.org/en/stable/migration_to_2xx.html",
+    )
 
 
 asyncio.run(main())
