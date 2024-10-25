@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import urllib.robotparser
 import asyncio
 from datetime import datetime, timezone
@@ -11,6 +13,8 @@ import sqlite3
 
 import aiohttp
 
+USERAGENT = 'webrrr'
+
 def now():
     return datetime.now(tz=timezone.utc)
 
@@ -21,6 +25,9 @@ class DB:
         self.con = sqlite3.connect(self.connection_string)
 
         self.create_tables()
+    
+    def close(self):
+        self.con.close()
 
     def create_tables(self):
         cur = self.con.cursor()
@@ -140,13 +147,11 @@ class DB:
 
 
 class Fetcher:
-    def __init__(self, start_url: str):
+    def __init__(self, start_url: str, num_workers: int = 5):
+        self.num_workers = num_workers
+
         self.start = time.time()
-        # self.robots_txts = dict() # {netloc: robots.txt}
 
-        # self.collected_data = dict()
-
-        # self.queue = {start_url}
         self.processing = set()
 
         self.session = aiohttp.ClientSession()
@@ -158,17 +163,19 @@ class Fetcher:
     
     def close(self):
         self.session.close()
+        self.db.close()
 
     def count_visited(self):
         return self.db.count_visited()
 
-    async def robots_check(self, url: str):
+    async def robots_txt_allows_visit(self, url: str):
         o = urllib.parse.urlparse(url)
 
         if not (robots_txt_contents := self.db.get_robots_txt_text(o.netloc)):
             robots_url = urllib.parse.urlunparse((o.scheme, o.netloc, "/robots.txt", '', '', ''))
             try:
                 async with self.session.get(robots_url, allow_redirects=True) as robots_response:
+                    # no robots.txt - implicit allow
                     if 400 <= robots_response.status <= 499:
                         return True
                     robots_response.raise_for_status()
@@ -187,7 +194,7 @@ class Fetcher:
     def get_next_url(self):
         return self.db.get_unvisited_url(self.processing)
 
-    async def process_one(self):
+    async def process_next_url(self):
         next_url = self.get_next_url()
         if next_url is None:
             return None
@@ -211,10 +218,10 @@ class Fetcher:
 
         print(f'total time: {t}, rate = {self.count_visited() / t}')
 
-    async def go(self):
+    async def orchestrate_url_visits(self):
 
-        MAX_POOL_SIZE = 5
-        pool = {asyncio.create_task(self.process_one())}
+        # pool = {asyncio.create_task(self.process_next_url())}
+        pool = set()
 
         pool_size = len(pool)
 
@@ -227,12 +234,11 @@ class Fetcher:
             pool = pending
             while len(pool) < pool_size and self.db.get_unvisited_url_count():
                 
-                pool.add(asyncio.create_task(self.process_one()))
+                pool.add(asyncio.create_task(self.process_next_url()))
             # slowly ramp up pool size so that we don't overwhelm single netloc at beginning
-            pool_size = min(MAX_POOL_SIZE, pool_size + 1)
+            pool_size = min(self.num_workers, pool_size + 1)
 
-            
-    def canonicalize(self, url_part: str, base_url: str)        :
+    def get_canonical_url(self, url_part: str, base_url: str):
         o = urllib.parse.urlparse(url_part)
 
         fragment = ''
@@ -246,7 +252,7 @@ class Fetcher:
 
     async def fetch_children(self, url: str):
         try:
-            if not (await self.robots_check(url)):
+            if not (await self.robots_txt_allows_visit(url)):
                 return set(), 'blocked by robots.txt'
             
             print(f'[{datetime.now().isoformat()}] FETCH {url}')
@@ -257,7 +263,7 @@ class Fetcher:
                 html_text = await response.text()
 
             match_iter = re.finditer(r'href="(?P<href>[^"]+)"', html_text)
-            urls = set(self.canonicalize(m.groups()[0], url) for m in match_iter)
+            urls = set(self.get_canonical_url(m.groups()[0], url) for m in match_iter)
             return urls, None
         except Exception as client_error:
             return set(), str(client_error)
@@ -268,6 +274,6 @@ async def main():
     # return
     f = Fetcher('https://docs.aiohttp.org/en/stable/migration_to_2xx.html')
 
-    await f.go()
+    await f.orchestrate_url_visits()
 
 asyncio.run(main())
