@@ -184,7 +184,7 @@ class DB:
         #                 URL2.netloc = URL.netloc
         #                 AND URL2.last_visited IS NOT NULL
         #         )
-        #     """,  # noqa: S608
+        #     """,
         #     list(exclude_netlocs),
         # )
         # if url is not None:
@@ -310,21 +310,18 @@ class Fetcher:
             robots_url = urllib.parse.urlunparse(
                 (url.scheme, url.netloc, "/robots.txt", "", "", ""),
             )
-            try:
-                async with self.session.get(
-                    robots_url,
-                    allow_redirects=True,
-                ) as robots_response:
-                    # no robots.txt - implicit allow
-                    if robots_response.status in (
-                        http.HTTPStatus.NOT_FOUND,
-                        http.HTTPStatus.FORBIDDEN,
-                    ):
-                        return True
-                    robots_response.raise_for_status()
-                    robots_txt_contents = await robots_response.text()
-            except (aiohttp.ClientError, UnicodeDecodeError):
-                return False
+            async with self.session.get(
+                robots_url,
+                allow_redirects=True,
+            ) as robots_response:
+                # no robots.txt - implicit allow
+                if robots_response.status in (
+                    http.HTTPStatus.NOT_FOUND,
+                    http.HTTPStatus.FORBIDDEN,
+                ):
+                    return True
+                robots_response.raise_for_status()
+                robots_txt_contents = await robots_response.text()
 
             self.db.insert_robots_txt(url.netloc, robots_txt_contents)
 
@@ -373,18 +370,15 @@ class Fetcher:
         if not (await self.robots_txt_allows_visit(url)):
             return set(), "blocked by robots.txt"
 
-        try:
-            async with self.session.get(url.geturl(), allow_redirects=True) as response:
-                if not response.ok:
-                    return set(), await response.text()
-                response.raise_for_status()
+        async with self.session.get(url.geturl(), allow_redirects=True) as response:
+            if not response.ok:
+                return set(), await response.text()
+            response.raise_for_status()
 
-                if response.content_type.lower() != "text/html":
-                    return set(), response.content_type
+            if response.content_type.lower() != "text/html":
+                return set(), response.content_type
 
-                html_text = await response.text()
-        except (aiohttp.ClientError, UnicodeDecodeError) as client_error:
-            return set(), str(client_error)
+            html_text = await response.text()
 
         match_iter = re.finditer(r'href="(?P<href>[^"]+)"', html_text)
         urls = {self.get_canonical_url(m.groups()[0], url) for m in match_iter}
@@ -420,8 +414,8 @@ async def orchestrate_url_visits(
 async def main() -> None:
     await orchestrate_url_visits(
         "profile_v1",
-        "https://docs.aiohttp.org/en/stable/migration_to_2xx.html",
-        1000,
+        "http://start.localhost:8000",
+        4,
         50000,
     )
 

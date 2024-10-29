@@ -6,9 +6,9 @@ from __future__ import annotations
 import asyncio
 import http
 import logging
+import queue
 import re
 import sqlite3
-import queue
 import time
 import urllib.parse
 import urllib.robotparser
@@ -54,11 +54,7 @@ def now(tz: timezone | None = None) -> datetime:
 def urlparse(url: str) -> ParseResult:
     """Parse URLs and strip fragments."""
     # parse URL, stripping fragment
-    try:
-        o = urllib.parse.urlparse(url=url)
-    except ValueError:
-        logging.exception("invalid link: %s", url)
-        raise
+    o = urllib.parse.urlparse(url=url)
     return ParseResult(
         scheme=o.scheme,
         netloc=o.netloc,
@@ -288,10 +284,7 @@ class DB:
 
     def insert_robots_txt(self, netloc: str, robots_txt: str) -> None:
         cur = self.con.cursor()
-        try:
-            cur.execute("INSERT INTO Robots Values (?, ?)", [netloc, robots_txt])
-        except sqlite3.IntegrityError:
-            logger.exception("inserting into robots")
+        cur.execute("INSERT INTO Robots Values (?, ?)", [netloc, robots_txt])
         cur.close()
         self.con.commit()
 
@@ -318,7 +311,9 @@ class PoolManager:
 
     def _pop_from_pool(self, url: ParseResult, task: asyncio.Task) -> None:
         self.pool.remove(task)
-        self.netlocs_currently_processing.remove(url.netloc)
+        # TODO - why is this check needed??
+        if url.netloc in self.netlocs_currently_processing:
+            self.netlocs_currently_processing.remove(url.netloc)
 
     async def wait(self) -> None:
         done_tasks, _pending_tasks = await asyncio.wait(
@@ -337,6 +332,8 @@ class Fetcher:
 
         self.processing = set()
 
+        self.robots_txt_fetching = set()
+
         self.session = aiohttp.ClientSession()
 
         self.db = DB(db_path)
@@ -348,11 +345,8 @@ class Fetcher:
         self.db.close()
 
     def get_unvisited_url(self, exclude_netlocs: set[str]) -> None | ParseResult:
-        for i in range(self.queue.qsize()):
-            try:
-                url = self.queue.get(block=False)
-            except queue.Empty:
-                return None
+        for _i in range(self.queue.qsize()):
+            url = self.queue.get(block=False)
             if url is None:
                 return None
 
@@ -361,14 +355,13 @@ class Fetcher:
             else:
                 return url
         return None
-        raise "ran out of queue"
 
     async def robots_txt_allows_visit(self, url: ParseResult) -> bool:
-        if not (robots_txt_contents := self.db.get_robots_txt_text(url.netloc)):
-            robots_url = urllib.parse.urlunparse(
-                (url.scheme, url.netloc, "/robots.txt", "", "", ""),
-            )
-            try:
+        async def helper():
+            if not (robots_txt_contents := self.db.get_robots_txt_text(url.netloc)):
+                robots_url = urllib.parse.urlunparse(
+                    (url.scheme, url.netloc, "/robots.txt", "", "", ""),
+                )
                 async with self.session.get(
                     robots_url,
                     allow_redirects=True,
@@ -382,16 +375,22 @@ class Fetcher:
                         return True
                     robots_response.raise_for_status()
                     robots_txt_contents = await robots_response.text()
-            except (aiohttp.ClientError, UnicodeDecodeError, asyncio.TimeoutError):
-                logger.exception("Request error")
-                return False
 
-            self.db.insert_robots_txt(url.netloc, robots_txt_contents)
+                logger.debug("Fetched robots.txt url: %s", robots_url)
+                self.db.insert_robots_txt(url.netloc, robots_txt_contents)
 
-        robot_file_parser = urllib.robotparser.RobotFileParser()
-        robot_file_parser.parse(robots_txt_contents.splitlines())
+            robot_file_parser = urllib.robotparser.RobotFileParser()
+            robot_file_parser.parse(robots_txt_contents.splitlines())
 
-        return robot_file_parser.can_fetch(useragent="webrrr", url=url.geturl())
+            return robot_file_parser.can_fetch(useragent="webrrr", url=url.geturl())
+
+        while url.netloc in self.robots_txt_fetching:
+            await asyncio.sleep(0.0)
+
+        self.robots_txt_fetching.add(url.netloc)
+        result = await helper()
+        self.robots_txt_fetching.remove(url.netloc)
+        return result
 
     def fetch_and_process_url_task(self, url: ParseResult) -> asyncio.Task:
         return asyncio.create_task(self._fetch_and_process_url(url))
@@ -436,37 +435,26 @@ class Fetcher:
         if not (await self.robots_txt_allows_visit(url)):
             return set(), "blocked by robots.txt"
 
-        try:
-            async with self.session.get(
-                url.geturl(),
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as response:
-                if not response.ok:
-                    return set(), f"CODE = {response.status}"
-                response.raise_for_status()
+        async with self.session.get(
+            url.geturl(),
+            allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as response:
+            if not response.ok:
+                return set(), f"CODE = {response.status}"
+            response.raise_for_status()
 
-                if response.content_type.lower() != "text/html":
-                    return set(), response.content_type
+            if response.content_type.lower() != "text/html":
+                return set(), response.content_type
 
-                html_text = await response.text()
-        except (
-            aiohttp.ClientError,
-            UnicodeDecodeError,
-            asyncio.TimeoutError,
-        ) as client_error:
-            return set(), str(client_error)
+            html_text = await response.text()
 
         match_iter = re.finditer(r'href="(?P<href>[^"]+)"', html_text)
         urls = set()
         for m in match_iter:
-            try:
-                url = self.get_canonical_url(m.groups()[0], url)
-                if url.scheme in {"http", "https"}:
-                    urls.add(url)
-            except ValueError:
-                # skip bad URLS
-                pass
+            url = self.get_canonical_url(m.groups()[0], url)
+            if url.scheme in {"http", "https"}:
+                urls.add(url)
         return urls, None
 
 
@@ -497,9 +485,9 @@ async def orchestrate_url_visits(
 
 async def main() -> None:
     await orchestrate_url_visits(
-        "profile_v1",
-        "https://docs.aiohttp.org/en/stable/migration_to_2xx.html",
-        1000,
+        ":memory:",
+        "http://start.localhost:8000",
+        3,
         50000,
     )
 
